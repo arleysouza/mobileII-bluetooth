@@ -6,7 +6,7 @@ Workspace Flutter com dois aplicativos de chat local e um pacote compartilhado:
 - `desktop/`: aplicativo Flutter desktop para notebook.
 - `shared/`: pacote Dart local com o contrato comum de mensagens.
 
-Os dois aplicativos usam o mesmo protocolo de mensagens para manter historico, reenviar mensagens pendentes e indicar os estados `Digitada`, `Recebida` e `Aberta`.
+Os dois aplicativos usam o mesmo protocolo de mensagens para manter histórico, reenviar mensagens pendentes e indicar os estados `Digitada`, `Recebida` e `Aberta`.
 
 ## Estrutura
 
@@ -41,33 +41,33 @@ O pacote `shared/` concentra o contrato que precisa ser igual no celular e no no
 
 - `MessageStatus`: estados da mensagem.
 - `MessagePacket`: pacote individual recebido ou enviado.
-- `MessageProtocol`: codificacao e decodificacao JSON.
+- `MessageProtocol`: codificação e decodificação JSON.
 - `MessageBatchItem`: item usado no envio em lote.
 
-Os apps importam esse pacote por dependencia local:
+Os apps importam esse pacote por dependência local:
 
 ```yaml
 connection_shared:
   path: ../shared
 ```
 
-## Comunicacao
+## Comunicação
 
-O identificador logico da aplicacao e:
+O identificador lógico da aplicação é:
 
 ```dart
 br.sp.gov.cps.dsm.chat
 ```
 
-Para a comunicacao BLE entre celular e notebook, os apps usam UUIDs derivados desse identificador:
+Para a comunicação BLE entre celular e notebook, os apps usam UUIDs derivados desse identificador:
 
 - Service UUID BLE: `07eab2e6-fc51-5e32-a09b-788f502b8ed7`
-- Caracteristica de escrita: `6dff0753-7a8e-57d7-9858-f4f4c781cb81`
-- Caracteristica de notificacao: `8bc8e5cf-54eb-59ff-a05d-f94177f07f8d`
+- Característica de escrita: `6dff0753-7a8e-57d7-9858-f4f4c781cb81`
+- Característica de notificação: `8bc8e5cf-54eb-59ff-a05d-f94177f07f8d`
 
-O celular tambem mantem um servico em primeiro plano para continuar disponivel para localizacao e conversa enquanto o app nao esta aberto na tela.
+O celular também mantém um serviço em primeiro plano para continuar disponível para localização e conversa enquanto o app não está aberto na tela.
 
-## Pre-requisitos
+## Pré-requisitos
 
 Instale e configure o Flutter SDK. Depois confirme o ambiente:
 
@@ -78,9 +78,9 @@ flutter doctor
 Para Android:
 
 - Android Studio ou Android SDK instalado.
-- Um celular Android real com depuracao USB ativada.
-- Bluetooth, Wi-Fi e localizacao ativados no celular.
-- Permissoes solicitadas pelo app concedidas no primeiro uso.
+- Um celular Android real com depuração USB ativada.
+- Bluetooth, Wi-Fi e localização ativados no celular.
+- Permissões solicitadas pelo app concedidas no primeiro uso.
 
 Para Windows desktop:
 
@@ -88,7 +88,7 @@ Para Windows desktop:
 - Workload `Desktop development with C++`.
 - Componentes de CMake e Windows SDK selecionados pelo instalador.
 
-Sem o Visual Studio com C++, o comando `flutter run -d windows` nao compila o app do notebook.
+Sem o Visual Studio com C++, o comando `flutter run -d windows` não compila o app do notebook.
 
 ## Rodar no celular
 
@@ -112,7 +112,7 @@ Se houver mais de um dispositivo conectado, informe o id:
 flutter run -d <id-do-celular>
 ```
 
-O app mobile fica fixo em orientacao vertical. Ao abrir, conceda as permissoes solicitadas e mantenha Bluetooth, Wi-Fi e localizacao ligados.
+O app mobile fica fixo em orientação vertical. Ao abrir, conceda as permissões solicitadas e mantenha Bluetooth, Wi-Fi e localização ligados.
 
 ## Rodar no notebook
 
@@ -135,7 +135,7 @@ flutter run -d macos
 
 1. Rode o app no celular.
 2. Rode o app no notebook.
-3. No notebook ou no celular, use as opcoes de busca para localizar celulares ou notebooks.
+3. No notebook ou no celular, use as opções de busca para localizar celulares ou notebooks.
 4. Selecione o dispositivo encontrado.
 5. Envie mensagens pelo campo de chat.
 6. Verifique os estados das mensagens:
@@ -145,9 +145,9 @@ flutter run -d macos
 
 As mensagens ficam persistidas localmente. Ao reconectar com um dispositivo conhecido, mensagens pendentes podem ser reenviadas em lote.
 
-## Comandos uteis
+## Comandos úteis
 
-Formatar os tres projetos:
+Formatar os três projetos:
 
 ```bash
 dart format app/lib app/test desktop/lib desktop/test shared/lib
@@ -168,8 +168,8 @@ cd app && flutter test
 cd ../desktop && flutter test
 ```
 
-## Observacoes
+## Observações
 
-- A versao Web/Chrome nao e alvo deste projeto, pois a comunicacao depende de APIs nativas.
-- Logs de recursos indisponiveis do aparelho, como NFC, podem ser ignorados se nao forem relacionados ao Bluetooth.
-- Se permissoes antigas ficarem presas durante testes Android, desinstale o app do celular e instale novamente.
+- A versão Web/Chrome não é alvo deste projeto, pois a comunicação depende de APIs nativas.
+- Logs de recursos indisponíveis do aparelho, como NFC, podem ser ignorados se não forem relacionados ao Bluetooth.
+- Se permissões antigas ficarem presas durante testes Android, desinstale o app do celular e instale novamente.
