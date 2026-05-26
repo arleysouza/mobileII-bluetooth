@@ -1,11 +1,11 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import 'package:exemplo_quatro/main.dart';
+import 'package:exemplo_quatro/app/connection_app.dart';
 
 void main() {
-  testWidgets('mostra a tela de contatos', (WidgetTester tester) async {
-    await tester.pumpWidget(const MyApp());
+  testWidgets('mostra tela principal de conexao', (tester) async {
+    await tester.pumpWidget(const ConnectionApp());
 
-    expect(find.text('Contatos'), findsOneWidget);
+    expect(find.text('Conexão Bluetooth'), findsOneWidget);
   });
 }

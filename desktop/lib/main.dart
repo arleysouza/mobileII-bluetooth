@@ -2,9 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:connection_shared/connection_shared.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:universal_ble/universal_ble.dart';
+
+part 'features/connection/models/connection_models.dart';
+part 'features/connection/data/message_protocol.dart';
+part 'features/connection/widgets/connection_widgets.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -51,6 +57,7 @@ class _ConnectionDesktopScreenState extends State<ConnectionDesktopScreen> {
       '6dff0753-7a8e-57d7-9858-f4f4c781cb81';
   static const String _notifyCharacteristicUuid =
       '8bc8e5cf-54eb-59ff-a05d-f94177f07f8d';
+  static const String _mensagensPrefsKey = 'desktop_connection_messages';
 
   final String _nomeUsuario = 'Notebook ${Random().nextInt(9000) + 1000}';
   final TextEditingController _mensagemController = TextEditingController();
@@ -73,6 +80,34 @@ class _ConnectionDesktopScreenState extends State<ConnectionDesktopScreen> {
     if (widget.configurarBluetooth) {
       _configurarBluetooth();
     }
+    unawaited(_carregarHistoricoMensagens());
+  }
+
+  Future<void> _carregarHistoricoMensagens() async {
+    final prefs = await SharedPreferences.getInstance();
+    final historico = prefs.getString(_mensagensPrefsKey);
+    if (!mounted || historico == null || historico.isEmpty) return;
+
+    final json = jsonDecode(historico);
+    if (json is! List) return;
+
+    setState(() {
+      _mensagens
+        ..clear()
+        ..addAll(
+          json.whereType<Map>().map(
+            (item) => _MensagemChat.fromJson(Map<String, dynamic>.from(item)),
+          ),
+        );
+    });
+  }
+
+  Future<void> _persistirMensagens() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _mensagensPrefsKey,
+      jsonEncode(_mensagens.map((mensagem) => mensagem.toJson()).toList()),
+    );
   }
 
   Future<void> _configurarBluetooth() async {
@@ -141,6 +176,7 @@ class _ConnectionDesktopScreenState extends State<ConnectionDesktopScreen> {
         setState(() {
           if (event.connected) {
             _clientesPeripheral[event.deviceId] = event.deviceId;
+            unawaited(_reenviarMensagensPendentes());
           } else {
             final nome =
                 _clientesPeripheral.remove(event.deviceId) ?? 'Aparelho';
@@ -320,6 +356,7 @@ class _ConnectionDesktopScreenState extends State<ConnectionDesktopScreen> {
         _aparelhosConectados[aparelho.deviceId] = aparelho;
       });
       await _garantirDisponibilidade();
+      unawaited(_reenviarMensagensPendentes());
       _mostrarMensagem('Conectado.');
     } catch (erro) {
       _definirErro(
@@ -337,8 +374,115 @@ class _ConnectionDesktopScreenState extends State<ConnectionDesktopScreen> {
     final texto = _mensagemController.text.trim();
     if (texto.isEmpty || !_possuiConexao) return;
 
-    final bytes = Uint8List.fromList(utf8.encode(texto));
+    final mensagemId = _novoIdMensagem();
+    setState(() {
+      _mensagens.add(
+        _MensagemChat(
+          id: mensagemId,
+          texto: texto,
+          remetente: _nomeUsuario,
+          enviadaPorMim: true,
+          status: MessageStatus.digitada,
+        ),
+      );
+      _mensagemController.clear();
+    });
+    unawaited(_persistirMensagens());
 
+    final bytes = _codificarMensagem(mensagemId, texto);
+
+    try {
+      for (final deviceId in _aparelhosConectados.keys) {
+        await UniversalBle.write(
+          deviceId,
+          _serviceUuid,
+          _messageCharacteristicUuid,
+          bytes,
+        );
+      }
+
+      if (_clientesPeripheral.isNotEmpty) {
+        await UniversalBlePeripheral.updateCharacteristicValue(
+          characteristicId: _notifyCharacteristicUuid,
+          value: bytes,
+        );
+      }
+
+      _atualizarStatusMensagem(mensagemId, MessageStatus.recebida);
+    } catch (erro) {
+      _definirErro('Nao foi possivel enviar a mensagem: $erro');
+    }
+  }
+
+  void _atualizarStatusMensagem(String mensagemId, MessageStatus status) {
+    if (!mounted) return;
+    final index = _mensagens.indexWhere(
+      (mensagem) => mensagem.id == mensagemId,
+    );
+    if (index == -1) return;
+
+    setState(() {
+      _mensagens[index] = _mensagens[index].copyWith(status: status);
+    });
+    unawaited(_persistirMensagens());
+  }
+
+  void _adicionarMensagemRecebidaAoHistorico(_MensagemChat mensagem) {
+    if (!mounted) return;
+
+    setState(() {
+      _mensagens.add(mensagem);
+    });
+    unawaited(_persistirMensagens());
+  }
+
+  void _adicionarMensagemRecebida(String deviceId, Uint8List value) {
+    final texto = utf8.decode(value, allowMalformed: true).trim();
+    if (texto.isEmpty || !mounted) return;
+
+    final nome =
+        _aparelhosConectados[deviceId]?.name ??
+        _clientesPeripheral[deviceId] ??
+        'Aparelho';
+
+    _processarPacotesRecebidos(texto, deviceId, nome);
+  }
+
+  Future<void> _enviarConfirmacaoAbertura(
+    String deviceId,
+    String mensagemId,
+  ) async {
+    final bytes = _codificarConfirmacaoAbertura(mensagemId);
+    if (_aparelhosConectados.containsKey(deviceId)) {
+      await UniversalBle.write(
+        deviceId,
+        _serviceUuid,
+        _messageCharacteristicUuid,
+        bytes,
+      );
+      return;
+    }
+
+    if (_clientesPeripheral.containsKey(deviceId)) {
+      await UniversalBlePeripheral.updateCharacteristicValue(
+        characteristicId: _notifyCharacteristicUuid,
+        value: bytes,
+        deviceId: deviceId,
+      );
+    }
+  }
+
+  Future<void> _reenviarMensagensPendentes() async {
+    final pendentes = _mensagens
+        .where(
+          (mensagem) =>
+              mensagem.enviadaPorMim &&
+              mensagem.status == MessageStatus.digitada,
+        )
+        .toList();
+    if (pendentes.isEmpty || !_possuiConexao) return;
+
+    final bytes = _codificarLoteMensagens(pendentes);
     for (final deviceId in _aparelhosConectados.keys) {
       await UniversalBle.write(
         deviceId,
@@ -355,32 +499,9 @@ class _ConnectionDesktopScreenState extends State<ConnectionDesktopScreen> {
       );
     }
 
-    setState(() {
-      _mensagens.add(
-        _MensagemChat(
-          texto: texto,
-          remetente: _nomeUsuario,
-          enviadaPorMim: true,
-        ),
-      );
-      _mensagemController.clear();
-    });
-  }
-
-  void _adicionarMensagemRecebida(String deviceId, Uint8List value) {
-    final texto = utf8.decode(value, allowMalformed: true).trim();
-    if (texto.isEmpty || !mounted) return;
-
-    final nome =
-        _aparelhosConectados[deviceId]?.name ??
-        _clientesPeripheral[deviceId] ??
-        'Aparelho';
-
-    setState(() {
-      _mensagens.add(
-        _MensagemChat(texto: texto, remetente: nome, enviadaPorMim: false),
-      );
-    });
+    for (final mensagem in pendentes) {
+      _atualizarStatusMensagem(mensagem.id, MessageStatus.recebida);
+    }
   }
 
   bool get _possuiConexao =>
@@ -533,253 +654,4 @@ class _ConnectionDesktopScreenState extends State<ConnectionDesktopScreen> {
       ),
     );
   }
-}
-
-class _PainelConexao extends StatelessWidget {
-  const _PainelConexao({
-    required this.nomeUsuario,
-    required this.serviceId,
-    required this.estadoBluetooth,
-    required this.anunciando,
-    required this.procurando,
-    required this.tipoBusca,
-    required this.conectados,
-  });
-
-  final String nomeUsuario;
-  final String serviceId;
-  final String estadoBluetooth;
-  final bool anunciando;
-  final bool procurando;
-  final _TipoBusca? tipoBusca;
-  final int conectados;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(nomeUsuario, style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 4),
-          Text('Bluetooth: $estadoBluetooth'),
-          Text('ServiceId: $serviceId'),
-          Text(
-            anunciando
-                ? 'Status: disponivel para conexoes'
-                : procurando
-                ? 'Status: buscando ${tipoBusca == _TipoBusca.notebooks ? 'notebooks' : 'celulares'}'
-                : 'Status: indisponivel',
-          ),
-          Text('Conectados: $conectados'),
-        ],
-      ),
-    );
-  }
-}
-
-class _AvisoCompatibilidade extends StatelessWidget {
-  const _AvisoCompatibilidade();
-
-  @override
-  Widget build(BuildContext context) {
-    final colorScheme = Theme.of(context).colorScheme;
-
-    return Container(
-      width: double.infinity,
-      margin: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: colorScheme.secondaryContainer,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text(
-        'Para o notebook encontrar o celular, deixe o celular em Disponivel. '
-        'Depois procure no desktop pelo nome salvo no celular. Se o celular apenas buscar o notebook, '
-        'ele conecta como cliente e nao aparece na busca do desktop.',
-        style: TextStyle(color: colorScheme.onSecondaryContainer),
-      ),
-    );
-  }
-}
-
-class _ListaAparelhos extends StatelessWidget {
-  const _ListaAparelhos({
-    required this.titulo,
-    required this.aparelhos,
-    required this.conectando,
-    required this.onConectar,
-  });
-
-  final String titulo;
-  final List<BleDevice> aparelhos;
-  final bool conectando;
-  final ValueChanged<BleDevice> onConectar;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
-          child: Text(titulo, style: Theme.of(context).textTheme.titleMedium),
-        ),
-        Expanded(
-          child: aparelhos.isEmpty
-              ? const Center(
-                  child: Padding(
-                    padding: EdgeInsets.all(16),
-                    child: Text('Nenhum aparelho encontrado.'),
-                  ),
-                )
-              : ListView.builder(
-                  itemCount: aparelhos.length,
-                  itemBuilder: (context, index) {
-                    final aparelho = aparelhos[index];
-                    final nome = aparelho.name?.isNotEmpty == true
-                        ? aparelho.name!
-                        : 'Aparelho sem nome';
-                    final servicos = aparelho.services.isEmpty
-                        ? 'sem servicos anunciados'
-                        : 'servicos: ${aparelho.services.join(', ')}';
-
-                    return ListTile(
-                      leading: const Icon(Icons.devices),
-                      title: Text(nome),
-                      subtitle: Text(
-                        [
-                          aparelho.deviceId,
-                          if (aparelho.rssi != null) 'RSSI ${aparelho.rssi}',
-                          servicos,
-                        ].join(' | '),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      trailing: IconButton(
-                        tooltip: 'Conectar',
-                        onPressed: conectando
-                            ? null
-                            : () => onConectar(aparelho),
-                        icon: conectando
-                            ? const SizedBox.square(
-                                dimension: 20,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : const Icon(Icons.link),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
-    );
-  }
-}
-
-class _Chat extends StatelessWidget {
-  const _Chat({
-    required this.mensagens,
-    required this.controller,
-    required this.conectado,
-    required this.onEnviar,
-  });
-
-  final List<_MensagemChat> mensagens;
-  final TextEditingController controller;
-  final bool conectado;
-  final VoidCallback onEnviar;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Expanded(
-          child: mensagens.isEmpty
-              ? const Center(
-                  child: Text('Conecte um aparelho para iniciar o chat.'),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: mensagens.length,
-                  itemBuilder: (context, index) {
-                    final mensagem = mensagens[index];
-                    final alinhamento = mensagem.enviadaPorMim
-                        ? Alignment.centerRight
-                        : Alignment.centerLeft;
-                    final cor = mensagem.enviadaPorMim
-                        ? Theme.of(context).colorScheme.primaryContainer
-                        : Theme.of(context).colorScheme.surfaceContainerHighest;
-
-                    return Align(
-                      alignment: alinhamento,
-                      child: Container(
-                        constraints: const BoxConstraints(maxWidth: 520),
-                        margin: const EdgeInsets.only(bottom: 8),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: cor,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              mensagem.remetente,
-                              style: Theme.of(context).textTheme.labelMedium,
-                            ),
-                            const SizedBox(height: 4),
-                            Text(mensagem.texto),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-        Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: controller,
-                  enabled: conectado,
-                  minLines: 1,
-                  maxLines: 4,
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    hintText: 'Digite uma mensagem',
-                  ),
-                  onSubmitted: conectado ? (_) => onEnviar() : null,
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                tooltip: 'Enviar',
-                onPressed: conectado ? onEnviar : null,
-                icon: const Icon(Icons.send),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _MensagemChat {
-  const _MensagemChat({
-    required this.texto,
-    required this.remetente,
-    required this.enviadaPorMim,
-  });
-
-  final String texto;
-  final String remetente;
-  final bool enviadaPorMim;
 }

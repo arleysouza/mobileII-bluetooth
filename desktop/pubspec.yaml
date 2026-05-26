@@ -8,8 +8,12 @@ environment:
   sdk: ^3.11.5
 
 dependencies:
+  connection_shared:
+    path: ../shared
+
   flutter:
     sdk: flutter
+  shared_preferences: ^2.5.3
   universal_ble: ^2.0.2
 
 dev_dependencies:

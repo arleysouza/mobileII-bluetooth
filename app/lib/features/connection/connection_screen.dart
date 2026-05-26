@@ -3,11 +3,18 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:connection_shared/connection_shared.dart';
 import 'package:flutter/material.dart';
 import 'package:nearby_connections/nearby_connections.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:universal_ble/universal_ble.dart';
+
+import '../../core/platform/connection_foreground_service.dart';
+
+part 'models/connection_models.dart';
+part 'data/message_protocol.dart';
+part 'widgets/connection_widgets.dart';
 
 class ConnectionScreen extends StatefulWidget {
   const ConnectionScreen({super.key});
@@ -20,7 +27,8 @@ enum _AcaoMenu { editarNome, buscarCelulares, buscarNotebooks }
 
 enum _TipoConversa { celular, notebookCentral, notebookPeripheral }
 
-class _ConnectionScreenState extends State<ConnectionScreen> {
+class _ConnectionScreenState extends State<ConnectionScreen>
+    with WidgetsBindingObserver {
   static const String _serviceId = 'br.sp.gov.cps.dsm.chat';
   static const String _serviceUuid = '07eab2e6-fc51-5e32-a09b-788f502b8ed7';
   static const String _messageCharacteristicUuid =
@@ -28,6 +36,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   static const String _notifyCharacteristicUuid =
       '8bc8e5cf-54eb-59ff-a05d-f94177f07f8d';
   static const String _nomeUsuarioPrefsKey = 'connection_user_name';
+  static const String _mensagensPrefsKey = 'connection_messages';
   static const Strategy _strategy = Strategy.P2P_CLUSTER;
 
   final TextEditingController _mensagemController = TextEditingController();
@@ -49,19 +58,33 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   bool _procurandoBle = false;
   bool _conectando = false;
   bool _conectandoBle = false;
+  bool _appEmPrimeiroPlano = true;
   String? _mensagemErro;
   late String _nomeUsuario;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _nomeUsuario = 'Aparelho ${Random().nextInt(9000) + 1000}';
     _configurarBle();
     unawaited(_inicializarDisponibilidade());
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final emPrimeiroPlano = state == AppLifecycleState.resumed;
+    if (_appEmPrimeiroPlano == emPrimeiroPlano) return;
+
+    _appEmPrimeiroPlano = emPrimeiroPlano;
+    if (emPrimeiroPlano && _conversaSelecionadaId != null) {
+      _marcarConversaComoAberta(_conversaSelecionadaId!);
+    }
+  }
+
   Future<void> _inicializarDisponibilidade() async {
     await _carregarNomeUsuario();
+    await _carregarHistoricoMensagens();
     if (!mounted) return;
     await _garantirDisponibilidade();
   }
@@ -72,6 +95,33 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     if (!mounted || nomeSalvo == null || nomeSalvo.isEmpty) return;
 
     setState(() => _nomeUsuario = nomeSalvo);
+  }
+
+  Future<void> _carregarHistoricoMensagens() async {
+    final prefs = await SharedPreferences.getInstance();
+    final historico = prefs.getString(_mensagensPrefsKey);
+    if (!mounted || historico == null || historico.isEmpty) return;
+
+    final json = jsonDecode(historico);
+    if (json is! List) return;
+
+    setState(() {
+      _mensagens
+        ..clear()
+        ..addAll(
+          json.whereType<Map>().map(
+            (item) => _MensagemChat.fromJson(Map<String, dynamic>.from(item)),
+          ),
+        );
+    });
+  }
+
+  Future<void> _persistirMensagens() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      _mensagensPrefsKey,
+      jsonEncode(_mensagens.map((mensagem) => mensagem.toJson()).toList()),
+    );
   }
 
   Future<void> _abrirEdicaoNome() async {
@@ -214,6 +264,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _mensagemController.dispose();
     for (final subscription in _subscriptions) {
       subscription.cancel();
@@ -238,6 +289,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     }
 
     await <Permission>[
+      Permission.notification,
       Permission.bluetoothAdvertise,
       Permission.bluetoothScan,
       Permission.bluetoothConnect,
@@ -269,6 +321,8 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
 
   Future<void> _iniciarAnuncio() async {
     if (!await _pedirPermissoes()) return;
+
+    await ConnectionForegroundService.start();
 
     final iniciadoBle = await _iniciarAnuncioBle();
 
@@ -478,6 +532,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         _notebooksConectados[notebook.deviceId] = notebook;
         _conversaSelecionadaId = _chaveNotebookCentral(notebook.deviceId);
       });
+      unawaited(
+        _reenviarMensagensPendentes(_chaveNotebookCentral(notebook.deviceId)),
+      );
       _atualizarModalBusca?.call();
       _mostrarMensagem('Notebook conectado.');
     } catch (erro) {
@@ -573,6 +630,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       _aparelhosEncontrados.removeWhere((item) => item.id == id);
       _conversaSelecionadaId = _chaveCelular(id);
     });
+    _marcarConversaComoAberta(_chaveCelular(id));
     _atualizarModalBusca?.call();
 
     await Nearby().acceptConnection(
@@ -584,17 +642,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         final nome =
             _aparelhosConectados[endpointId]?.endpointName ?? 'Aparelho';
         final conversaId = _chaveCelular(endpointId);
-
-        setState(() {
-          _mensagens.add(
-            _MensagemChat(
-              conversaId: conversaId,
-              texto: texto,
-              remetente: nome,
-              enviadaPorMim: false,
-            ),
-          );
-        });
+        _processarPacotesRecebidos(texto, conversaId, nome);
       },
       onPayloadTransferUpdate: (_, update) {},
     );
@@ -605,6 +653,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       setState(() {
         _conectando = false;
       });
+      unawaited(_reenviarMensagensPendentes(_chaveCelular(id)));
       _mostrarMensagem('Conectado.');
       return;
     }
@@ -651,8 +700,147 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
     final conversa = _conversaSelecionada;
     if (texto.isEmpty || conversa == null) return;
 
-    final bytes = Uint8List.fromList(utf8.encode(texto));
+    final mensagemId = _novoIdMensagem();
+    setState(() {
+      _mensagens.add(
+        _MensagemChat(
+          id: mensagemId,
+          conversaId: conversa.id,
+          texto: texto,
+          remetente: _nomeUsuario,
+          enviadaPorMim: true,
+          status: MessageStatus.digitada,
+        ),
+      );
+      _mensagemController.clear();
+    });
+    unawaited(_persistirMensagens());
 
+    final bytes = _codificarMensagem(mensagemId, texto);
+
+    try {
+      switch (conversa.tipo) {
+        case _TipoConversa.celular:
+          await Nearby().sendBytesPayload(conversa.deviceId, bytes);
+        case _TipoConversa.notebookCentral:
+          await UniversalBle.write(
+            conversa.deviceId,
+            _serviceUuid,
+            _messageCharacteristicUuid,
+            bytes,
+          );
+        case _TipoConversa.notebookPeripheral:
+          await UniversalBlePeripheral.updateCharacteristicValue(
+            characteristicId: _notifyCharacteristicUuid,
+            value: bytes,
+          );
+      }
+      _atualizarStatusMensagem(mensagemId, MessageStatus.recebida);
+    } catch (erro) {
+      _definirErro('Não foi possível enviar a mensagem: $erro');
+    }
+  }
+
+  void _atualizarStatusMensagem(String mensagemId, MessageStatus status) {
+    if (!mounted) return;
+    final index = _mensagens.indexWhere(
+      (mensagem) => mensagem.id == mensagemId,
+    );
+    if (index == -1) return;
+
+    setState(() {
+      _mensagens[index] = _mensagens[index].copyWith(status: status);
+    });
+    unawaited(_persistirMensagens());
+  }
+
+  void _adicionarMensagemRecebidaAoHistorico(_MensagemChat mensagem) {
+    setState(() {
+      _mensagens.add(mensagem);
+    });
+    unawaited(_persistirMensagens());
+  }
+
+  void _adicionarMensagemBle(String deviceId, Uint8List value) {
+    final texto = utf8.decode(value, allowMalformed: true).trim();
+    if (texto.isEmpty || !mounted) return;
+
+    final nome =
+        _notebooksConectados[deviceId]?.name ??
+        _clientesBlePeripheral[deviceId] ??
+        'Notebook';
+    final conversaId = _notebooksConectados.containsKey(deviceId)
+        ? _chaveNotebookCentral(deviceId)
+        : _chaveNotebookPeripheral(deviceId);
+    _processarPacotesRecebidos(texto, conversaId, nome);
+  }
+
+  void _marcarConversaComoAberta(String conversaId) {
+    if (!mounted || !_conversaEstaAberta(conversaId)) return;
+    var alterou = false;
+
+    for (var i = 0; i < _mensagens.length; i++) {
+      final mensagem = _mensagens[i];
+      if (mensagem.conversaId == conversaId &&
+          !mensagem.enviadaPorMim &&
+          mensagem.status != MessageStatus.aberta) {
+        _mensagens[i] = mensagem.copyWith(status: MessageStatus.aberta);
+        alterou = true;
+        unawaited(_enviarConfirmacaoAbertura(conversaId, mensagem.id));
+      }
+    }
+
+    if (alterou) {
+      setState(() {});
+      unawaited(_persistirMensagens());
+    }
+  }
+
+  bool _conversaEstaAberta(String conversaId) {
+    return _appEmPrimeiroPlano && _conversaSelecionadaId == conversaId;
+  }
+
+  Future<void> _enviarConfirmacaoAbertura(
+    String conversaId,
+    String mensagemId,
+  ) async {
+    final conversa = _conversaPorId(conversaId);
+    if (conversa == null) return;
+
+    final bytes = _codificarConfirmacaoAbertura(mensagemId);
+    switch (conversa.tipo) {
+      case _TipoConversa.celular:
+        await Nearby().sendBytesPayload(conversa.deviceId, bytes);
+      case _TipoConversa.notebookCentral:
+        await UniversalBle.write(
+          conversa.deviceId,
+          _serviceUuid,
+          _messageCharacteristicUuid,
+          bytes,
+        );
+      case _TipoConversa.notebookPeripheral:
+        await UniversalBlePeripheral.updateCharacteristicValue(
+          characteristicId: _notifyCharacteristicUuid,
+          value: bytes,
+        );
+    }
+  }
+
+  Future<void> _reenviarMensagensPendentes(String conversaId) async {
+    final conversa = _conversaPorId(conversaId);
+    if (conversa == null) return;
+
+    final pendentes = _mensagens
+        .where(
+          (mensagem) =>
+              mensagem.conversaId == conversaId &&
+              mensagem.enviadaPorMim &&
+              mensagem.status == MessageStatus.digitada,
+        )
+        .toList();
+    if (pendentes.isEmpty) return;
+
+    final bytes = _codificarLoteMensagens(pendentes);
     switch (conversa.tipo) {
       case _TipoConversa.celular:
         await Nearby().sendBytesPayload(conversa.deviceId, bytes);
@@ -670,40 +858,9 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
         );
     }
 
-    setState(() {
-      _mensagens.add(
-        _MensagemChat(
-          conversaId: conversa.id,
-          texto: texto,
-          remetente: _nomeUsuario,
-          enviadaPorMim: true,
-        ),
-      );
-      _mensagemController.clear();
-    });
-  }
-
-  void _adicionarMensagemBle(String deviceId, Uint8List value) {
-    final texto = utf8.decode(value, allowMalformed: true).trim();
-    if (texto.isEmpty || !mounted) return;
-
-    final nome =
-        _notebooksConectados[deviceId]?.name ??
-        _clientesBlePeripheral[deviceId] ??
-        'Notebook';
-    final conversaId = _notebooksConectados.containsKey(deviceId)
-        ? _chaveNotebookCentral(deviceId)
-        : _chaveNotebookPeripheral(deviceId);
-    setState(() {
-      _mensagens.add(
-        _MensagemChat(
-          conversaId: conversaId,
-          texto: texto,
-          remetente: nome,
-          enviadaPorMim: false,
-        ),
-      );
-    });
+    for (final mensagem in pendentes) {
+      _atualizarStatusMensagem(mensagem.id, MessageStatus.recebida);
+    }
   }
 
   String _chaveCelular(String id) => 'celular:$id';
@@ -747,6 +904,10 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
   _Conversa? get _conversaSelecionada {
     final id = _conversaSelecionadaId;
     if (id == null) return null;
+    return _conversaPorId(id);
+  }
+
+  _Conversa? _conversaPorId(String id) {
     for (final conversa in _conversas) {
       if (conversa.id == id) return conversa;
     }
@@ -930,6 +1091,7 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
                       bleDisponivel: _anunciandoBle,
                       onSelecionar: (conversa) {
                         setState(() => _conversaSelecionadaId = conversa.id);
+                        _marcarConversaComoAberta(conversa.id);
                       },
                     )
                   : _Chat(
@@ -944,458 +1106,4 @@ class _ConnectionScreenState extends State<ConnectionScreen> {
       ),
     );
   }
-}
-
-class _DialogEdicaoNome extends StatefulWidget {
-  const _DialogEdicaoNome({required this.nomeInicial});
-
-  final String nomeInicial;
-
-  @override
-  State<_DialogEdicaoNome> createState() => _DialogEdicaoNomeState();
-}
-
-class _DialogEdicaoNomeState extends State<_DialogEdicaoNome> {
-  late final TextEditingController _controller;
-
-  @override
-  void initState() {
-    super.initState();
-    _controller = TextEditingController(text: widget.nomeInicial);
-  }
-
-  @override
-  void dispose() {
-    _controller.dispose();
-    super.dispose();
-  }
-
-  void _salvar() {
-    Navigator.of(context).pop(_controller.text);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Nome do aparelho'),
-      content: TextField(
-        controller: _controller,
-        autofocus: true,
-        textCapitalization: TextCapitalization.words,
-        maxLength: 32,
-        decoration: const InputDecoration(
-          border: OutlineInputBorder(),
-          hintText: 'Digite seu nome',
-        ),
-        onSubmitted: (_) => _salvar(),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancelar'),
-        ),
-        FilledButton(onPressed: _salvar, child: const Text('Salvar')),
-      ],
-    );
-  }
-}
-
-class _ListaConversas extends StatelessWidget {
-  const _ListaConversas({
-    required this.conversas,
-    required this.mensagens,
-    required this.nomeUsuario,
-    required this.disponivel,
-    required this.nearbyDisponivel,
-    required this.bleDisponivel,
-    required this.onSelecionar,
-  });
-
-  final List<_Conversa> conversas;
-  final List<_MensagemChat> mensagens;
-  final String nomeUsuario;
-  final bool disponivel;
-  final bool nearbyDisponivel;
-  final bool bleDisponivel;
-  final ValueChanged<_Conversa> onSelecionar;
-
-  @override
-  Widget build(BuildContext context) {
-    if (conversas.isEmpty) {
-      return Center(
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(
-                Icons.forum_outlined,
-                size: 48,
-                color: Theme.of(context).colorScheme.outline,
-              ),
-              const SizedBox(height: 12),
-              Text(nomeUsuario, style: Theme.of(context).textTheme.titleMedium),
-              const SizedBox(height: 8),
-              Text(
-                disponivel
-                    ? 'Celulares: ${nearbyDisponivel ? 'disponível' : 'indisponível'} | Notebooks: ${bleDisponivel ? 'disponível' : 'indisponível'}'
-                    : 'Use o menu para ficar disponível ou buscar dispositivos.',
-                textAlign: TextAlign.center,
-              ),
-            ],
-          ),
-        ),
-      );
-    }
-
-    return ListView.separated(
-      itemCount: conversas.length,
-      separatorBuilder: (_, _) => const Divider(height: 1),
-      itemBuilder: (context, index) {
-        final conversa = conversas[index];
-        _MensagemChat? ultimaMensagem;
-        for (final mensagem in mensagens) {
-          if (mensagem.conversaId == conversa.id) {
-            ultimaMensagem = mensagem;
-          }
-        }
-
-        return ListTile(
-          leading: CircleAvatar(child: Icon(conversa.icone)),
-          title: Text(
-            conversa.nome,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          subtitle: Text(
-            ultimaMensagem?.texto ?? conversa.subtitulo,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          trailing: const Icon(Icons.chevron_right),
-          onTap: () => onSelecionar(conversa),
-        );
-      },
-    );
-  }
-}
-
-class _ModalBuscaCelulares extends StatelessWidget {
-  const _ModalBuscaCelulares({
-    required this.aparelhos,
-    required this.conectando,
-    required this.onConectar,
-  });
-
-  final List<_AparelhoEncontrado> aparelhos;
-  final bool conectando;
-  final ValueChanged<_AparelhoEncontrado> onConectar;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: MediaQuery.sizeOf(context).height * 0.65,
-      child: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Row(
-              children: [
-                Text(
-                  'Buscar celulares',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const Spacer(),
-                const SizedBox.square(
-                  dimension: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: _ListaAparelhos(
-              aparelhos: aparelhos,
-              conectando: conectando,
-              onConectar: onConectar,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ModalBuscaNotebooks extends StatelessWidget {
-  const _ModalBuscaNotebooks({
-    required this.notebooks,
-    required this.conectando,
-    required this.onConectar,
-  });
-
-  final List<BleDevice> notebooks;
-  final bool conectando;
-  final ValueChanged<BleDevice> onConectar;
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: MediaQuery.sizeOf(context).height * 0.65,
-      child: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-            child: Row(
-              children: [
-                Text(
-                  'Buscar notebooks',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const Spacer(),
-                const SizedBox.square(
-                  dimension: 20,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: _ListaNotebooks(
-              notebooks: notebooks,
-              conectando: conectando,
-              onConectar: onConectar,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ListaAparelhos extends StatelessWidget {
-  const _ListaAparelhos({
-    required this.aparelhos,
-    required this.conectando,
-    required this.onConectar,
-  });
-
-  final List<_AparelhoEncontrado> aparelhos;
-  final bool conectando;
-  final ValueChanged<_AparelhoEncontrado> onConectar;
-
-  @override
-  Widget build(BuildContext context) {
-    if (aparelhos.isEmpty) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(16),
-          child: Text('Nenhum aparelho encontrado.'),
-        ),
-      );
-    }
-
-    return ListView.builder(
-      itemCount: aparelhos.length,
-      itemBuilder: (context, index) {
-        final aparelho = aparelhos[index];
-
-        return ListTile(
-          leading: const Icon(Icons.devices),
-          title: Text(aparelho.nome),
-          subtitle: Text(aparelho.id),
-          trailing: IconButton(
-            tooltip: 'Conectar',
-            onPressed: conectando ? null : () => onConectar(aparelho),
-            icon: conectando
-                ? const SizedBox.square(
-                    dimension: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.link),
-          ),
-        );
-      },
-    );
-  }
-}
-
-class _ListaNotebooks extends StatelessWidget {
-  const _ListaNotebooks({
-    required this.notebooks,
-    required this.conectando,
-    required this.onConectar,
-  });
-
-  final List<BleDevice> notebooks;
-  final bool conectando;
-  final ValueChanged<BleDevice> onConectar;
-
-  @override
-  Widget build(BuildContext context) {
-    if (notebooks.isEmpty) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(16),
-          child: Text('Nenhum notebook encontrado.'),
-        ),
-      );
-    }
-
-    return ListView.builder(
-      itemCount: notebooks.length,
-      itemBuilder: (context, index) {
-        final notebook = notebooks[index];
-        final nome = notebook.name?.isNotEmpty == true
-            ? notebook.name!
-            : 'Notebook BLE';
-
-        return ListTile(
-          leading: const Icon(Icons.computer),
-          title: Text(nome),
-          subtitle: Text(notebook.deviceId),
-          trailing: IconButton(
-            tooltip: 'Conectar',
-            onPressed: conectando ? null : () => onConectar(notebook),
-            icon: conectando
-                ? const SizedBox.square(
-                    dimension: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.link),
-          ),
-        );
-      },
-    );
-  }
-}
-
-class _Chat extends StatelessWidget {
-  const _Chat({
-    required this.mensagens,
-    required this.controller,
-    required this.conectado,
-    required this.onEnviar,
-  });
-
-  final List<_MensagemChat> mensagens;
-  final TextEditingController controller;
-  final bool conectado;
-  final VoidCallback onEnviar;
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      children: [
-        Expanded(
-          child: mensagens.isEmpty
-              ? const Center(
-                  child: Text('Conecte um aparelho para iniciar o chat.'),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: mensagens.length,
-                  itemBuilder: (context, index) {
-                    final mensagem = mensagens[index];
-                    final alinhamento = mensagem.enviadaPorMim
-                        ? Alignment.centerRight
-                        : Alignment.centerLeft;
-                    final cor = mensagem.enviadaPorMim
-                        ? Theme.of(context).colorScheme.primaryContainer
-                        : Theme.of(context).colorScheme.surfaceContainerHighest;
-
-                    return Align(
-                      alignment: alinhamento,
-                      child: Container(
-                        constraints: const BoxConstraints(maxWidth: 420),
-                        margin: const EdgeInsets.only(bottom: 8),
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: cor,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Text(
-                              mensagem.remetente,
-                              style: Theme.of(context).textTheme.labelMedium,
-                            ),
-                            const SizedBox(height: 4),
-                            Text(mensagem.texto),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
-        ),
-        Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: controller,
-                  enabled: conectado,
-                  minLines: 1,
-                  maxLines: 4,
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
-                    hintText: 'Digite uma mensagem',
-                  ),
-                  onSubmitted: conectado ? (_) => onEnviar() : null,
-                ),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                tooltip: 'Enviar',
-                onPressed: conectado ? onEnviar : null,
-                icon: const Icon(Icons.send),
-              ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _AparelhoEncontrado {
-  const _AparelhoEncontrado({required this.id, required this.nome});
-
-  final String id;
-  final String nome;
-}
-
-class _Conversa {
-  const _Conversa({
-    required this.id,
-    required this.deviceId,
-    required this.nome,
-    required this.subtitulo,
-    required this.tipo,
-    required this.icone,
-  });
-
-  final String id;
-  final String deviceId;
-  final String nome;
-  final String subtitulo;
-  final _TipoConversa tipo;
-  final IconData icone;
-}
-
-class _MensagemChat {
-  const _MensagemChat({
-    required this.conversaId,
-    required this.texto,
-    required this.remetente,
-    required this.enviadaPorMim,
-  });
-
-  final String conversaId;
-  final String texto;
-  final String remetente;
-  final bool enviadaPorMim;
 }

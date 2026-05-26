@@ -8,6 +8,9 @@ environment:
   sdk: ^3.11.5
 
 dependencies:
+  connection_shared:
+    path: ../shared
+
   flutter:
     sdk: flutter
 
