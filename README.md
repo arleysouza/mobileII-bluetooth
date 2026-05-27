@@ -1,4 +1,4 @@
-# Connection
+# Comunicação entre dispositivos próximos utilizando Bluetooth 
 
 Workspace Flutter com dois aplicativos de chat local e um pacote compartilhado:
 
