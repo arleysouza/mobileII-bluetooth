@@ -59,6 +59,9 @@ O identificador lógico da aplicação é:
 br.sp.gov.cps.dsm.chat
 ```
 
+Entre celulares, o app usa `nearby_connections` com a estratégia `P2P_CLUSTER`.
+Essa API faz a descoberta e o transporte por recursos próximos disponíveis no Android, incluindo Bluetooth/BLE e Wi-Fi quando aplicável. Entre celular e notebook, a comunicação implementada diretamente no projeto é BLE por meio de `universal_ble`.
+
 Para a comunicação BLE entre celular e notebook, os apps usam UUIDs derivados desse identificador:
 
 - Service UUID BLE: `07eab2e6-fc51-5e32-a09b-788f502b8ed7`
@@ -66,6 +69,64 @@ Para a comunicação BLE entre celular e notebook, os apps usam UUIDs derivados 
 - Característica de notificação: `8bc8e5cf-54eb-59ff-a05d-f94177f07f8d`
 
 O celular também mantém um serviço em primeiro plano para continuar disponível para localização e conversa enquanto o app não está aberto na tela.
+
+## Permissões Android
+
+O app Android declara permissões para descoberta de dispositivos próximos, comunicação BLE/Nearby e execução em segundo plano:
+
+- `ACCESS_COARSE_LOCATION` e `ACCESS_FINE_LOCATION`: exigidas pelo Android para descoberta de dispositivos próximos em APIs que usam Bluetooth/BLE e Nearby.
+- `BLUETOOTH` e `BLUETOOTH_ADMIN`: compatibilidade com versões antigas do Android.
+- `BLUETOOTH_ADVERTISE`, `BLUETOOTH_SCAN` e `BLUETOOTH_CONNECT`: anunciar, buscar e conectar dispositivos BLE no Android 12 ou superior.
+- `NEARBY_WIFI_DEVICES`: descoberta de dispositivos próximos usando recursos de Wi-Fi no Android 13 ou superior.
+- `ACCESS_WIFI_STATE` e `CHANGE_WIFI_STATE`: suporte aos recursos de Wi-Fi usados por bibliotecas de proximidade.
+- `POST_NOTIFICATIONS`: exibir a notificação persistente do serviço em primeiro plano no Android 13 ou superior.
+- `FOREGROUND_SERVICE` e `FOREGROUND_SERVICE_CONNECTED_DEVICE`: manter um serviço de conexão ativo em primeiro plano.
+- `READ_CONTACTS` e `CAMERA`: permissões declaradas para funcionalidades auxiliares do app, não para o transporte de mensagens.
+
+Em runtime, a tela de conexão solicita localização, notificações, permissões Bluetooth e `nearbyWifiDevices`. Além de conceder as permissões, o usuário deve manter Bluetooth, Wi-Fi e localização ativados no aparelho para que a descoberta funcione de forma consistente.
+
+## Execução em background
+
+Quando o celular fica disponível para conexões, o app inicia `ConnectionForegroundService` por meio de um `MethodChannel` Flutter. No Android, esse serviço chama `startForeground`, usa o tipo `connectedDevice` e exibe uma notificação persistente com a mensagem de que a conexão está ativa.
+
+Esse serviço reduz a chance de o Android interromper a disponibilidade do app quando ele sai da tela principal. Ainda assim, o comportamento pode variar conforme fabricante, modo de economia de bateria e restrições do sistema. Para testes mais estáveis, desative otimizações agressivas de bateria para o app e mantenha a notificação do serviço ativa.
+
+## Diagrama de sequência de mensagens
+
+```mermaid
+sequenceDiagram
+    participant A as Dispositivo A
+    participant PA as Protocolo A
+    participant T as Transporte Nearby/BLE
+    participant PB as Protocolo B
+    participant B as Dispositivo B
+
+    A->>PA: Usuário envia texto
+    PA->>PA: Gera id e codifica pacote message
+    PA->>A: Registra mensagem como Digitada
+    PA->>T: Envia bytes
+    PA->>A: Atualiza envio local para Recebida
+    T->>PB: Entrega bytes
+    PB->>PB: Decodifica message ou batch
+    PB->>B: Salva mensagem recebida
+
+    alt Conversa aberta no destino
+        B->>PB: Marca mensagem como Aberta
+        PB->>T: Envia pacote opened(id)
+        T->>PA: Entrega confirmação
+        PA->>A: Atualiza status para Aberta
+    else Conversa fechada no destino
+        B->>PB: Marca mensagem como Recebida
+    end
+
+    opt Reconexão com mensagens pendentes
+        A->>PA: Localiza mensagens Digitadas
+        PA->>T: Envia batch de pendências
+        T->>PB: Entrega lote
+        PB->>B: Salva mensagens ainda não vistas
+        PA->>A: Atualiza pendências para Recebida
+    end
+```
 
 ## Pré-requisitos
 
